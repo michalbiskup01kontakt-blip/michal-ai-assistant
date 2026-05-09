@@ -13,109 +13,158 @@ const supabase = createClient(
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
-
-    const { messages, userEmail, googleAccessToken } = body;
+    const { messages, userEmail, googleAccessToken } = await req.json();
 
     const lastMessage = messages[messages.length - 1]?.text || "";
 
-    // zapis wiadomości użytkownika
     await supabase.from("messages").insert({
       role: "user",
       text: lastMessage,
       user_email: userEmail,
     });
 
-    // sprawdzenie czy użytkownik chce utworzyć wydarzenie
-    const calendarIntent = await openai.responses.create({
+    const actionCheck = await openai.responses.create({
       model: "gpt-4.1-mini",
       input: `
 Dzisiaj jest ${new Date().toISOString()}.
+Strefa czasowa: Europe/Warsaw.
 
-Przeanalizuj wiadomość użytkownika i sprawdź,
-czy chce utworzyć wydarzenie w kalendarzu.
+Rozpoznaj intencję użytkownika.
 
 Wiadomość:
 "${lastMessage}"
 
-Jeśli TAK:
-zwróć WYŁĄCZNIE JSON:
+Zwróć WYŁĄCZNIE JSON:
 
+Dla kalendarza:
 {
-  "calendar": true,
+  "action": "calendar",
   "title": "...",
   "start": "...",
   "end": "...",
   "description": "..."
 }
 
-Daty zwracaj w formacie ISO.
-
-Jeśli NIE:
+Dla arkusza Google:
 {
-  "calendar": false
+  "action": "sheets",
+  "title": "nazwa arkusza",
+  "sheetName": "Dane",
+  "headers": ["Data", "Kategoria", "Opis", "Kwota", "Uwagi"],
+  "rows": []
+}
+
+Jeśli to zwykła rozmowa:
+{
+  "action": "none"
 }
       `,
     });
 
-    let parsed: any = {};
+    let action: any = { action: "none" };
 
     try {
-      parsed = JSON.parse(calendarIntent.output_text);
+      action = JSON.parse(actionCheck.output_text);
     } catch {
-      parsed = { calendar: false };
+      action = { action: "none" };
     }
 
-    // tworzenie wydarzenia
-    if (parsed.calendar === true) {
-      if (!googleAccessToken) {
-        return Response.json({
-          text: "Brak dostępu do Google Calendar. Zaloguj się ponownie.",
-        });
-      }
-
-      const oauth2Client = new google.auth.OAuth2();
-
-      oauth2Client.setCredentials({
-        access_token: googleAccessToken,
+    if ((action.action === "calendar" || action.action === "sheets") && !googleAccessToken) {
+      const text = "Brak dostępu do Google. Wyloguj się i zaloguj ponownie przez Google.";
+      await supabase.from("messages").insert({
+        role: "assistant",
+        text,
+        user_email: userEmail,
       });
+      return Response.json({ text });
+    }
 
+    const oauth2Client = new google.auth.OAuth2();
+    oauth2Client.setCredentials({
+      access_token: googleAccessToken,
+    });
+
+    if (action.action === "calendar") {
       const calendar = google.calendar({
         version: "v3",
         auth: oauth2Client,
       });
 
-      const createdEvent = await calendar.events.insert({
+      await calendar.events.insert({
         calendarId: "primary",
         requestBody: {
-          summary: parsed.title,
-          description: parsed.description,
+          summary: action.title,
+          description: action.description,
           start: {
-            dateTime: parsed.start,
+            dateTime: action.start,
             timeZone: "Europe/Warsaw",
           },
           end: {
-            dateTime: parsed.end,
+            dateTime: action.end,
             timeZone: "Europe/Warsaw",
           },
         },
       });
 
-      const assistantResponse = `Gotowe ✅ Dodałem wydarzenie do Twojego kalendarza: "${parsed.title}"`;
+      const text = `Gotowe ✅ Dodałem wydarzenie do kalendarza: "${action.title}"`;
 
       await supabase.from("messages").insert({
         role: "assistant",
-        text: assistantResponse,
+        text,
         user_email: userEmail,
       });
 
-      return Response.json({
-        text: assistantResponse,
-        eventLink: createdEvent.data.htmlLink,
-      });
+      return Response.json({ text });
     }
 
-    // normalna odpowiedź AI
+    if (action.action === "sheets") {
+      const sheets = google.sheets({
+        version: "v4",
+        auth: oauth2Client,
+      });
+
+      const spreadsheet = await sheets.spreadsheets.create({
+        requestBody: {
+          properties: {
+            title: action.title || "Nowy arkusz AI",
+          },
+          sheets: [
+            {
+              properties: {
+                title: action.sheetName || "Dane",
+              },
+            },
+          ],
+        },
+      });
+
+      const spreadsheetId = spreadsheet.data.spreadsheetId!;
+      const sheetName = action.sheetName || "Dane";
+
+      const headers = action.headers?.length
+        ? action.headers
+        : ["Data", "Kategoria", "Opis", "Kwota", "Uwagi"];
+
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `${sheetName}!A1`,
+        valueInputOption: "USER_ENTERED",
+        requestBody: {
+          values: [headers, ...(action.rows || [])],
+        },
+      });
+
+      const text = `Gotowe ✅ Utworzyłem arkusz Google: "${action.title}". Link: ${spreadsheet.data.spreadsheetUrl}`;
+
+      await supabase.from("messages").insert({
+        role: "assistant",
+        text,
+        user_email: userEmail,
+      });
+
+      return Response.json({ text });
+    }
+
     const response = await openai.responses.create({
       model: "gpt-4.1-mini",
       tools: [{ type: "web_search" }],
@@ -127,7 +176,6 @@ Jeśli NIE:
 
     const assistantText = response.output_text;
 
-    // zapis odpowiedzi AI
     await supabase.from("messages").insert({
       role: "assistant",
       text: assistantText,
