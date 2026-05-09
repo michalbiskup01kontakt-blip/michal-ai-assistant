@@ -20,6 +20,7 @@ export async function POST(request: Request) {
 
   const response = await client.responses.create({
     model: "gpt-4.1-mini",
+    tools: [{ type: "web_search" }],
     input: messages.map((message: any) => ({
       role: message.role,
       content: message.text,
