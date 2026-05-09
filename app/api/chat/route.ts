@@ -188,7 +188,7 @@ export async function POST(req: Request) {
       const formatted = files
         .map(
           (f, i) =>
-            `${i + 1}. ${f.name}\nTyp: ${f.mimeType}\nLink: ${f.webViewLink}`
+            `${i + 1}. [${f.name}](${f.webViewLink})\nTyp: ${f.mimeType}`
         )
         .join("\n\n");
 
