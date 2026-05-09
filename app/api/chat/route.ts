@@ -1,775 +1,426 @@
+import { NextResponse } from "next/server";
 import OpenAI from "openai";
-import { google } from "googleapis";
 import { createClient } from "@supabase/supabase-js";
+import { google } from "googleapis";
+import * as XLSX from "xlsx";
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: process.env.OPENAI_API_KEY!,
 });
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
-
-function normalize(text: string) {
-  return text.toLowerCase();
-}
-
-function escapeGoogleQuery(text: string) {
-  return text.replace(/'/g, "\\'");
-}
-
-function cleanBase64Url(data?: string | null) {
-  if (!data) return "";
-  return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
-}
-
-async function saveAssistantMessage(text: string, userEmail: string | null) {
-  await supabase.from("messages").insert({
-    role: "assistant",
-    text,
-    user_email: userEmail,
-  });
-}
-
-function detectMemorySave(message: string) {
-  const text = normalize(message);
-  return (
-    text.includes("zapamiętaj") ||
-    text.includes("pamietaj") ||
-    text.includes("zapamiętasz") ||
-    text.includes("następnym razem")
-  );
-}
-
-function detectDriveSearch(message: string) {
-  const text = normalize(message);
-  return (
-    text.includes("dysk") ||
-    text.includes("drive") ||
-    text.includes("plik") ||
-    text.includes("folder")
-  );
-}
-
-function detectGmailSearch(message: string) {
-  const text = normalize(message);
-  return (
-    text.includes("gmail") ||
-    text.includes("mail") ||
-    text.includes("maile") ||
-    text.includes("maila") ||
-    text.includes("poczta") ||
-    text.includes("wiadomość") ||
-    text.includes("wiadomości") ||
-    text.includes("faktura") ||
-    text.includes("faktury")
-  );
-}
-
-function detectSheetCreate(message: string) {
-  const text = normalize(message);
-
-  return (
-    (text.includes("stwórz") ||
-      text.includes("utwórz") ||
-      text.includes("załóż")) &&
-    (text.includes("arkusz") ||
-      text.includes("arkuszu") ||
-      text.includes("tabelę") ||
-      text.includes("tabela"))
-  );
-}
-
-function detectSheetQuestion(message: string) {
-  const text = normalize(message);
-
-  const mentionsSheet =
-    text.includes("arkusz") ||
-    text.includes("arkuszu") ||
-    text.includes("arkusza") ||
-    text.includes("tabela") ||
-    text.includes("wydatki") ||
-    text.includes("personel") ||
-    text.includes("excel");
-
-  const asksData =
-    text.includes("znajdź") ||
-    text.includes("wyszukaj") ||
-    text.includes("pokaż") ||
-    text.includes("sprawdź") ||
-    text.includes("ile") ||
-    text.includes("jaki") ||
-    text.includes("jaka") ||
-    text.includes("jakie") ||
-    text.includes("kto") ||
-    text.includes("numer") ||
-    text.includes("telefon") ||
-    text.includes("mail") ||
-    text.includes("email") ||
-    text.includes("suma") ||
-    text.includes("podsumuj") ||
-    text.includes("przeanalizuj") ||
-    text.includes("dane");
-
-  return mentionsSheet && asksData && !detectSheetCreate(message);
-}
-
-function extractBasicSheetName(message: string) {
-  const text = normalize(message);
-
-  if (text.includes("wydatki maj 2026")) return "Wydatki maj 2026";
-  if (text.includes("wydatki")) return "wydatki";
-  if (text.includes("personel")) return "Personel";
-
-  const match = message.match(
-    /arkusz(?:u|a)?\s+["']?([a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9\s_-]+)["']?/i
-  );
-
-  if (match?.[1]) {
-    return match[1].trim();
-  }
-
-  return "";
-}
 
 export async function POST(req: Request) {
   try {
-    const { messages, userEmail, googleAccessToken } = await req.json();
+    const body = await req.json();
 
-    const lastMessage = messages[messages.length - 1]?.text || "";
+    const message = body.message;
+    const accessToken = body.accessToken;
+    const userEmail = body.userEmail;
 
+    if (!message) {
+      return NextResponse.json({
+        reply: "Brak wiadomości.",
+      });
+    }
+
+    // ZAPIS USER MSG
     await supabase.from("messages").insert({
       role: "user",
-      text: lastMessage,
-      user_email: userEmail,
+      text: message,
     });
 
-    // ================= MEMORY SAVE =================
+    // =========================
+    // GOOGLE AUTH
+    // =========================
 
-    if (detectMemorySave(lastMessage)) {
-      const memoryAI = await openai.responses.create({
-        model: "gpt-4.1-mini",
-        input: `
-Wyciągnij z wiadomości użytkownika informację do zapamiętania.
-
-Wiadomość:
-"${lastMessage}"
-
-Zwróć WYŁĄCZNIE JSON:
-{
-  "key": "krótka nazwa informacji",
-  "value": "konkretna wartość do zapamiętania"
-}
-        `,
-      });
-
-      let parsedMemory: any = null;
-
-      try {
-        parsedMemory = JSON.parse(memoryAI.output_text);
-      } catch {
-        parsedMemory = null;
-      }
-
-      if (parsedMemory?.key && parsedMemory?.value) {
-        await supabase.from("memory").insert({
-          user_email: userEmail,
-          key: parsedMemory.key,
-          value: parsedMemory.value,
-        });
-
-        const text = `Zapamiętałem ✅ ${parsedMemory.key}: ${parsedMemory.value}`;
-
-        await saveAssistantMessage(text, userEmail);
-
-        return Response.json({ text });
-      }
-    }
-
-    // ================= MEMORY LOAD =================
-
-    const { data: memoryData } = await supabase
-      .from("memory")
-      .select("*")
-      .eq("user_email", userEmail);
-
-    const memoryContext =
-      memoryData && memoryData.length > 0
-        ? `
-Zapamiętane informacje użytkownika:
-${memoryData.map((m) => `${m.key}: ${m.value}`).join("\n")}
-`
-        : "";
-
-    if (!googleAccessToken) {
-      const response = await openai.responses.create({
-        model: "gpt-4.1-mini",
-        tools: [{ type: "web_search" }],
-        input: [
-          {
-            role: "system",
-            content: memoryContext,
-          },
-          ...messages.map((msg: any) => ({
-            role: msg.role,
-            content: msg.text,
-          })),
-        ],
-      });
-
-      const assistantText = response.output_text;
-
-      await saveAssistantMessage(assistantText, userEmail);
-
-      return Response.json({ text: assistantText });
-    }
-
-    const oauth2Client = new google.auth.OAuth2();
-
-    oauth2Client.setCredentials({
-      access_token: googleAccessToken,
+    const auth = new google.auth.OAuth2();
+    auth.setCredentials({
+      access_token: accessToken,
     });
 
     const drive = google.drive({
       version: "v3",
-      auth: oauth2Client,
-    });
-
-    const sheets = google.sheets({
-      version: "v4",
-      auth: oauth2Client,
+      auth,
     });
 
     const gmail = google.gmail({
       version: "v1",
-      auth: oauth2Client,
+      auth,
     });
 
-    // ================= GMAIL — WYSZUKIWANIE I ANALIZA MAILI =================
+    const sheets = google.sheets({
+      version: "v4",
+      auth,
+    });
 
-    if (detectGmailSearch(lastMessage) && !detectSheetQuestion(lastMessage)) {
-      const gmailIntent = await openai.responses.create({
-        model: "gpt-4.1-mini",
-        input: `
-Użytkownik chce znaleźć albo przeanalizować maile Gmail.
+    const lower = message.toLowerCase();
 
-Wiadomość:
-"${lastMessage}"
+    // =====================================================
+    // MEMORY
+    // =====================================================
 
-Zamień to na zapytanie Gmail search query.
+    if (
+      lower.includes("zapamiętaj") ||
+      lower.includes("pamietaj")
+    ) {
+      const content = message
+        .replace("zapamiętaj", "")
+        .replace("pamietaj", "")
+        .trim();
 
-Zwróć WYŁĄCZNIE JSON:
-{
-  "query": "zapytanie Gmail",
-  "question": "pełne pytanie użytkownika"
-}
-
-Przykłady:
-- "pokaż ostatnie maile" -> "newer_than:14d"
-- "znajdź faktury z maja" -> "faktura OR invoice after:2026/05/01 before:2026/06/01"
-- "czy Adam pisał o spotkaniu" -> "Adam spotkanie"
-- "pokaż maile od Google" -> "from:google"
-        `,
+      await supabase.from("memory").insert({
+        user_email: userEmail,
+        key: content.substring(0, 50),
+        value: content,
       });
 
-      let gmailParsed: any = {
-        query: "newer_than:14d",
-        question: lastMessage,
-      };
+      return NextResponse.json({
+        reply: `Zapamiętałem ✅ ${content}`,
+      });
+    }
 
-      try {
-        gmailParsed = JSON.parse(gmailIntent.output_text);
-      } catch {
-        gmailParsed = {
-          query: "newer_than:14d",
-          question: lastMessage,
-        };
+    // =====================================================
+    // MEMORY SEARCH
+    // =====================================================
+
+    if (
+      lower.includes("czy pamiętasz") ||
+      lower.includes("pamietasz") ||
+      lower.includes("przypomnij")
+    ) {
+      const { data } = await supabase
+        .from("memory")
+        .select("*")
+        .eq("user_email", userEmail);
+
+      if (!data?.length) {
+        return NextResponse.json({
+          reply: "Nie mam jeszcze zapisanych informacji.",
+        });
       }
 
-      const list = await gmail.users.messages.list({
+      const joined = data.map((x) => x.value).join("\n");
+
+      return NextResponse.json({
+        reply: `Pamiętam:\n\n${joined}`,
+      });
+    }
+
+    // =====================================================
+    // GMAIL
+    // =====================================================
+
+    if (
+      lower.includes("mail") ||
+      lower.includes("gmail") ||
+      lower.includes("maile")
+    ) {
+      const gmailRes = await gmail.users.messages.list({
         userId: "me",
-        q: gmailParsed.query || "newer_than:14d",
-        maxResults: 10,
+        maxResults: 5,
       });
 
-      const ids = list.data.messages || [];
+      const msgs = gmailRes.data.messages || [];
 
-      if (!ids.length) {
-        const text = `Nie znalazłem maili pasujących do zapytania: "${gmailParsed.query}".`;
-
-        await saveAssistantMessage(text, userEmail);
-
-        return Response.json({ text });
+      if (!msgs.length) {
+        return NextResponse.json({
+          reply: "Nie znalazłem maili.",
+        });
       }
 
-      const emails: any[] = [];
+      let result = "📧 Ostatnie maile:\n\n";
 
-      for (const item of ids) {
-        if (!item.id) continue;
-
-        const msg = await gmail.users.messages.get({
+      for (const msg of msgs) {
+        const full = await gmail.users.messages.get({
           userId: "me",
-          id: item.id,
-          format: "full",
+          id: msg.id!,
         });
 
-        const headers = msg.data.payload?.headers || [];
+        const headers = full.data.payload?.headers || [];
 
         const subject =
-          headers.find((h) => h.name?.toLowerCase() === "subject")?.value || "";
+          headers.find((h) => h.name === "Subject")?.value ||
+          "Brak tematu";
+
         const from =
-          headers.find((h) => h.name?.toLowerCase() === "from")?.value || "";
-        const date =
-          headers.find((h) => h.name?.toLowerCase() === "date")?.value || "";
+          headers.find((h) => h.name === "From")?.value ||
+          "Nieznany";
 
-        let body = "";
-
-        if (msg.data.payload?.body?.data) {
-          body = cleanBase64Url(msg.data.payload.body.data);
-        } else if (msg.data.payload?.parts?.length) {
-          const plainPart =
-            msg.data.payload.parts.find((p) => p.mimeType === "text/plain") ||
-            msg.data.payload.parts.find((p) => p.mimeType === "text/html");
-
-          body = cleanBase64Url(plainPart?.body?.data);
-        }
-
-        emails.push({
-          subject,
-          from,
-          date,
-          snippet: msg.data.snippet,
-          body: body.slice(0, 2500),
-        });
+        result += `📩 ${subject}\n👤 ${from}\n\n`;
       }
 
-      const analysis = await openai.responses.create({
-        model: "gpt-4.1-mini",
-        input: `
-Jesteś prywatnym asystentem analizującym Gmail użytkownika.
-
-${memoryContext}
-
-Pytanie użytkownika:
-${gmailParsed.question || lastMessage}
-
-Zapytanie Gmail:
-${gmailParsed.query}
-
-Znalezione maile:
-${JSON.stringify(emails)}
-
-Zasady:
-- Odpowiedz po polsku.
-- Nie mów, że nie masz dostępu do Gmaila, bo dane maili masz powyżej.
-- Jeśli użytkownik pyta o faktury, wypisz znalezione faktury i nadawców.
-- Jeśli użytkownik pyta o ważne maile, wybierz najważniejsze.
-- Jeśli pytanie dotyczy konkretnej osoby/tematu, znajdź pasujące maile.
-- Jeśli nie ma jednoznacznej informacji, napisz to jasno.
-        `,
+      return NextResponse.json({
+        reply: result,
       });
-
-      const text = analysis.output_text;
-
-      await saveAssistantMessage(text, userEmail);
-
-      return Response.json({ text });
     }
 
-    // ================= GOOGLE SHEETS — INTELIGENTNE WYSZUKIWANIE DANYCH =================
+    // =====================================================
+    // DRIVE FILES
+    // =====================================================
 
-    if (detectSheetQuestion(lastMessage)) {
-      const sheetIntent = await openai.responses.create({
-        model: "gpt-4.1-mini",
-        input: `
-Użytkownik pyta o dane z arkusza Google.
-
-Wiadomość:
-"${lastMessage}"
-
-Wyciągnij:
-1. nazwę arkusza,
-2. pytanie,
-3. szukaną osobę/temat, jeśli występuje,
-4. typ operacji.
-
-Zwróć WYŁĄCZNIE JSON:
-{
-  "sheetName": "nazwa arkusza",
-  "question": "pełne pytanie użytkownika",
-  "searchTerm": "osoba, temat albo kategoria",
-  "operation": "find | sum | list | analyze"
-}
-
-Jeśli nazwa arkusza nie jest jasna, wpisz pusty string.
-        `,
-      });
-
-      let parsedSheet: any = {
-        sheetName: extractBasicSheetName(lastMessage),
-        question: lastMessage,
-        searchTerm: "",
-        operation: "analyze",
-      };
-
-      try {
-        parsedSheet = JSON.parse(sheetIntent.output_text);
-      } catch {
-        parsedSheet = {
-          sheetName: extractBasicSheetName(lastMessage),
-          question: lastMessage,
-          searchTerm: "",
-          operation: "analyze",
-        };
-      }
-
-      const sheetNameToFind =
-        parsedSheet.sheetName?.trim() || extractBasicSheetName(lastMessage);
-
-      if (!sheetNameToFind) {
-        const text =
-          "Podaj proszę nazwę arkusza, z którego mam odczytać dane.";
-
-        await saveAssistantMessage(text, userEmail);
-
-        return Response.json({ text });
-      }
-
+    if (
+      lower.includes("plik") ||
+      lower.includes("dysk") ||
+      lower.includes("drive")
+    ) {
       const files = await drive.files.list({
-        q: `mimeType='application/vnd.google-apps.spreadsheet' and trashed=false and name contains '${escapeGoogleQuery(
-          sheetNameToFind
-        )}'`,
-        fields: "files(id,name,webViewLink,modifiedTime)",
         pageSize: 10,
-        includeItemsFromAllDrives: true,
-        supportsAllDrives: true,
+        fields: "files(id,name,mimeType,webViewLink)",
       });
 
-      const foundFile = files.data.files?.[0];
+      const items = files.data.files || [];
 
-      if (!foundFile?.id) {
-        const text = `Nie znalazłem arkusza o nazwie zawierającej: "${sheetNameToFind}".`;
-
-        await saveAssistantMessage(text, userEmail);
-
-        return Response.json({ text });
-      }
-
-      const spreadsheetInfo = await sheets.spreadsheets.get({
-        spreadsheetId: foundFile.id,
-      });
-
-      const allSheets =
-        spreadsheetInfo.data.sheets?.map((sheet) => sheet.properties?.title) ||
-        [];
-
-      const allData: Record<string, any[][]> = {};
-
-      for (const tabName of allSheets) {
-        if (!tabName) continue;
-
-        const sheetData = await sheets.spreadsheets.values.get({
-          spreadsheetId: foundFile.id,
-          range: `${tabName}!A1:Z2000`,
+      if (!items.length) {
+        return NextResponse.json({
+          reply: "Nie znalazłem plików.",
         });
-
-        allData[tabName] = sheetData.data.values || [];
       }
 
-      const analysis = await openai.responses.create({
-        model: "gpt-4.1-mini",
-        input: `
-Jesteś asystentem analizującym dane z Google Sheets.
+      let text = "📁 Oto Twoje pliki:\n\n";
 
-${memoryContext}
-
-Znaleziony arkusz:
-${foundFile.name}
-
-Link do arkusza:
-${foundFile.webViewLink}
-
-Pytanie użytkownika:
-${parsedSheet.question || lastMessage}
-
-Szukana fraza:
-${parsedSheet.searchTerm || ""}
-
-Typ operacji:
-${parsedSheet.operation || "analyze"}
-
-Dane ze wszystkich zakładek arkusza:
-${JSON.stringify(allData)}
-
-Zasady:
-- Odpowiedz po polsku.
-- Sam analizuj dane, nie dawaj instrukcji.
-- Jeśli w pamięci jest korekta dotycząca pytanej osoby/wartości, pamięć ma pierwszeństwo.
-- Jeśli pytanie dotyczy numeru telefonu, maila, osoby lub konkretnego rekordu, znajdź najlepszy pasujący wiersz.
-- Jeśli pytanie dotyczy sumy, policz sumę na podstawie danych.
-- Jeśli pytanie dotyczy listy, wypisz pasujące rekordy.
-- Jeśli dane są puste, napisz że arkusz jest pusty.
-- Jeśli nie ma pasujących danych, napisz że nie znalazłeś.
-- Na końcu podaj link do arkusza.
-        `,
+      items.forEach((f, i) => {
+        text += `${i + 1}. ${f.name}\n${f.webViewLink}\n\n`;
       });
 
-      const text = analysis.output_text;
-
-      await saveAssistantMessage(text, userEmail);
-
-      return Response.json({ text });
+      return NextResponse.json({
+        reply: text,
+      });
     }
 
-    // ================= GOOGLE DRIVE — WYSZUKIWANIE PLIKÓW =================
+    // =====================================================
+    // FIND SHEET
+    // =====================================================
 
-    if (detectDriveSearch(lastMessage)) {
-      const lower = normalize(lastMessage);
+    if (
+      lower.includes("arkusz") ||
+      lower.includes("excel") ||
+      lower.includes("sheet")
+    ) {
+      const files = await drive.files.list({
+        pageSize: 20,
+        fields: "files(id,name,mimeType,webViewLink)",
+      });
 
-      if (lower.includes("ostatnie")) {
-        const recentFiles = await drive.files.list({
-          pageSize: 10,
-          orderBy: "modifiedTime desc",
-          fields: "files(id,name,mimeType,modifiedTime,webViewLink)",
-          includeItemsFromAllDrives: true,
-          supportsAllDrives: true,
-        });
+      const items = files.data.files || [];
 
-        const files = recentFiles.data.files || [];
-
-        if (!files.length) {
-          const text = "Nie znalazłem żadnych plików na Dysku Google.";
-
-          await saveAssistantMessage(text, userEmail);
-
-          return Response.json({ text });
-        }
-
-        const formatted = files
-          .map(
-            (f, i) =>
-              `${i + 1}. ${f.name}\nTyp: ${f.mimeType}\nLink: ${f.webViewLink}`
-          )
-          .join("\n\n");
-
-        const text = `Oto Twoje ostatnie pliki z Dysku Google:\n\n${formatted}`;
-
-        await saveAssistantMessage(text, userEmail);
-
-        return Response.json({ text });
-      }
-
-      let searchQuery = lastMessage;
-
-      const match = lastMessage.match(
-        /(?:plik|folder|arkusz|dokument)\s+(.+)/i
+      const xlsxFile = items.find(
+        (f) =>
+          f.name?.toLowerCase().includes("personel") ||
+          f.name?.toLowerCase().includes("wydatki")
       );
 
-      if (match?.[1]) {
-        searchQuery = match[1];
+      if (!xlsxFile) {
+        return NextResponse.json({
+          reply: "Nie znalazłem odpowiedniego arkusza.",
+        });
       }
 
-      const filesResult = await drive.files.list({
-        q: `name contains '${escapeGoogleQuery(searchQuery)}' and trashed=false`,
-        pageSize: 10,
-        fields: "files(id,name,mimeType,modifiedTime,webViewLink)",
-        includeItemsFromAllDrives: true,
-        supportsAllDrives: true,
+      return NextResponse.json({
+        reply: `📄 Znalazłem arkusz:\n\n${xlsxFile.name}\n${xlsxFile.webViewLink}`,
       });
-
-      const files = filesResult.data.files || [];
-
-      if (!files.length) {
-        const text = `Nie znalazłem plików pasujących do: "${searchQuery}".`;
-
-        await saveAssistantMessage(text, userEmail);
-
-        return Response.json({ text });
-      }
-
-      const formatted = files
-        .map(
-          (f, i) =>
-            `${i + 1}. ${f.name}\nTyp: ${f.mimeType}\nLink: ${f.webViewLink}`
-        )
-        .join("\n\n");
-
-      const text = `Znalazłem pliki:\n\n${formatted}`;
-
-      await saveAssistantMessage(text, userEmail);
-
-      return Response.json({ text });
     }
 
-    // ================= GOOGLE SHEETS — TWORZENIE ARKUSZA =================
+    // =====================================================
+    // XLSX / GOOGLE SHEETS SEARCH
+    // =====================================================
 
-    if (detectSheetCreate(lastMessage)) {
-      const createIntent = await openai.responses.create({
-        model: "gpt-4.1-mini",
-        input: `
-Użytkownik chce stworzyć arkusz Google.
-
-Wiadomość:
-"${lastMessage}"
-
-Zwróć WYŁĄCZNIE JSON:
-{
-  "title": "nazwa arkusza",
-  "sheetName": "Dane",
-  "headers": ["Data", "Kategoria", "Opis", "Kwota", "Uwagi"],
-  "rows": []
-}
-        `,
+    if (
+      lower.includes("numer") ||
+      lower.includes("telefon") ||
+      lower.includes("email") ||
+      lower.includes("kontakt")
+    ) {
+      const files = await drive.files.list({
+        pageSize: 30,
+        fields: "files(id,name,mimeType)",
       });
 
-      let action: any = {};
+      const allFiles = files.data.files || [];
 
-      try {
-        action = JSON.parse(createIntent.output_text);
-      } catch {
-        action = {
-          title: "Nowy arkusz AI",
-          sheetName: "Dane",
-          headers: ["Data", "Kategoria", "Opis", "Kwota", "Uwagi"],
-          rows: [],
-        };
+      const target = allFiles.find((f) =>
+        f.name?.toLowerCase().includes("personel")
+      );
+
+      if (!target) {
+        return NextResponse.json({
+          reply: "Nie znalazłem arkusza Personel.",
+        });
       }
 
-      const spreadsheet = await sheets.spreadsheets.create({
-        requestBody: {
-          properties: {
-            title: action.title || "Nowy arkusz AI",
-          },
-          sheets: [
+      // =========================================
+      // GOOGLE SHEETS
+      // =========================================
+
+      if (
+        target.mimeType ===
+        "application/vnd.google-apps.spreadsheet"
+      ) {
+        const sheetData = await sheets.spreadsheets.values.get({
+          spreadsheetId: target.id!,
+          range: "A:Z",
+        });
+
+        const rows = sheetData.data.values || [];
+
+        const prompt = `
+Znajdź poprawną odpowiedź w tabeli.
+
+Tabela:
+${JSON.stringify(rows)}
+
+Pytanie:
+${message}
+
+Odpowiedz krótko i konkretnie.
+`;
+
+        const ai = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
             {
-              properties: {
-                title: action.sheetName || "Dane",
-              },
+              role: "user",
+              content: prompt,
             },
           ],
+        });
+
+        return NextResponse.json({
+          reply: ai.choices[0].message.content,
+        });
+      }
+
+      // =========================================
+      // XLSX
+      // =========================================
+
+      const fileRes = await drive.files.get(
+        {
+          fileId: target.id!,
+          alt: "media",
         },
+        {
+          responseType: "arraybuffer",
+        }
+      );
+
+      const workbook = XLSX.read(fileRes.data, {
+        type: "buffer",
       });
 
-      const spreadsheetId = spreadsheet.data.spreadsheetId!;
-      const sheetName = action.sheetName || "Dane";
+      const firstSheet =
+        workbook.Sheets[workbook.SheetNames[0]];
 
-      const headers = action.headers?.length
-        ? action.headers
-        : ["Data", "Kategoria", "Opis", "Kwota", "Uwagi"];
-
-      await sheets.spreadsheets.values.update({
-        spreadsheetId,
-        range: `${sheetName}!A1`,
-        valueInputOption: "USER_ENTERED",
-        requestBody: {
-          values: [headers, ...(action.rows || [])],
-        },
+      const jsonData = XLSX.utils.sheet_to_json(firstSheet, {
+        header: 1,
       });
 
-      const text = `Gotowe ✅ Utworzyłem arkusz Google: "${action.title}". Link: ${spreadsheet.data.spreadsheetUrl}`;
+      const prompt = `
+Znajdź poprawną odpowiedź w tabeli Excel.
 
-      await saveAssistantMessage(text, userEmail);
+Tabela:
+${JSON.stringify(jsonData)}
 
-      return Response.json({ text });
+Pytanie:
+${message}
+
+Odpowiedz bardzo krótko.
+`;
+
+      const ai = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+      });
+
+      return NextResponse.json({
+        reply: ai.choices[0].message.content,
+      });
     }
 
-    // ================= GOOGLE CALENDAR =================
+    // =====================================================
+    // CALENDAR
+    // =====================================================
 
-    const calendarIntent = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      input: `
-Dzisiaj jest ${new Date().toISOString()}.
-Strefa czasowa: Europe/Warsaw.
-
-Sprawdź, czy użytkownik chce dodać wydarzenie do kalendarza.
-
-Wiadomość:
-"${lastMessage}"
-
-Zwróć WYŁĄCZNIE JSON:
-{
-  "calendar": true,
-  "title": "...",
-  "start": "...",
-  "end": "...",
-  "description": "..."
-}
-
-albo:
-
-{
-  "calendar": false
-}
-      `,
-    });
-
-    let calendarData: any = { calendar: false };
-
-    try {
-      calendarData = JSON.parse(calendarIntent.output_text);
-    } catch {
-      calendarData = { calendar: false };
-    }
-
-    if (calendarData.calendar === true) {
+    if (
+      lower.includes("spotkanie") ||
+      lower.includes("kalendarz")
+    ) {
       const calendar = google.calendar({
         version: "v3",
-        auth: oauth2Client,
+        auth,
       });
+
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+
+      const start = new Date(tomorrow);
+      start.setHours(13, 0, 0);
+
+      const end = new Date(tomorrow);
+      end.setHours(14, 0, 0);
 
       await calendar.events.insert({
         calendarId: "primary",
         requestBody: {
-          summary: calendarData.title,
-          description: calendarData.description,
+          summary: "Spotkanie",
           start: {
-            dateTime: calendarData.start,
-            timeZone: "Europe/Warsaw",
+            dateTime: start.toISOString(),
           },
           end: {
-            dateTime: calendarData.end,
-            timeZone: "Europe/Warsaw",
+            dateTime: end.toISOString(),
           },
         },
       });
 
-      const text = `Gotowe ✅ Dodałem wydarzenie do Twojego kalendarza: "${calendarData.title}"`;
-
-      await saveAssistantMessage(text, userEmail);
-
-      return Response.json({ text });
+      return NextResponse.json({
+        reply: "✅ Dodałem wydarzenie do kalendarza.",
+      });
     }
 
-    // ================= NORMALNY CHAT + INTERNET + MEMORY =================
+    // =====================================================
+    // DEFAULT AI
+    // =====================================================
 
-    const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      tools: [{ type: "web_search" }],
-      input: [
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
         {
           role: "system",
-          content: memoryContext,
+          content:
+            "Jesteś prywatnym polskim asystentem AI Michała.",
         },
-        ...messages.map((msg: any) => ({
-          role: msg.role,
-          content: msg.text,
-        })),
+        {
+          role: "user",
+          content: message,
+        },
       ],
     });
 
-    const assistantText = response.output_text;
+    const reply =
+      completion.choices[0].message.content ||
+      "Brak odpowiedzi.";
 
-    await saveAssistantMessage(assistantText, userEmail);
-
-    return Response.json({
-      text: assistantText,
+    await supabase.from("messages").insert({
+      role: "assistant",
+      text: reply,
     });
-  } catch (error) {
+
+    return NextResponse.json({
+      reply,
+    });
+  } catch (error: any) {
     console.error(error);
 
-    return Response.json({
-      text: "Wystąpił błąd serwera.",
+    return NextResponse.json({
+      reply: "Wystąpił błąd serwera.",
     });
   }
 }
