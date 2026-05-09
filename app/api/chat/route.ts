@@ -19,26 +19,51 @@ function escapeGoogleQuery(text: string) {
   return text.replace(/'/g, "\\'");
 }
 
+function cleanBase64Url(data?: string | null) {
+  if (!data) return "";
+  return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
+}
+
+async function saveAssistantMessage(text: string, userEmail: string | null) {
+  await supabase.from("messages").insert({
+    role: "assistant",
+    text,
+    user_email: userEmail,
+  });
+}
+
 function detectMemorySave(message: string) {
   const text = normalize(message);
-
   return (
     text.includes("zapamiętaj") ||
     text.includes("pamietaj") ||
     text.includes("zapamiętasz") ||
-    text.includes("następnym razem będziesz pamiętał") ||
-    text.includes("następnym razem bedziesz pamietal")
+    text.includes("następnym razem")
   );
 }
 
 function detectDriveSearch(message: string) {
   const text = normalize(message);
-
   return (
     text.includes("dysk") ||
     text.includes("drive") ||
     text.includes("plik") ||
     text.includes("folder")
+  );
+}
+
+function detectGmailSearch(message: string) {
+  const text = normalize(message);
+  return (
+    text.includes("gmail") ||
+    text.includes("mail") ||
+    text.includes("maile") ||
+    text.includes("maila") ||
+    text.includes("poczta") ||
+    text.includes("wiadomość") ||
+    text.includes("wiadomości") ||
+    text.includes("faktura") ||
+    text.includes("faktury")
   );
 }
 
@@ -65,7 +90,8 @@ function detectSheetQuestion(message: string) {
     text.includes("arkusza") ||
     text.includes("tabela") ||
     text.includes("wydatki") ||
-    text.includes("personel");
+    text.includes("personel") ||
+    text.includes("excel");
 
   const asksData =
     text.includes("znajdź") ||
@@ -83,7 +109,8 @@ function detectSheetQuestion(message: string) {
     text.includes("email") ||
     text.includes("suma") ||
     text.includes("podsumuj") ||
-    text.includes("przeanalizuj");
+    text.includes("przeanalizuj") ||
+    text.includes("dane");
 
   return mentionsSheet && asksData && !detectSheetCreate(message);
 }
@@ -104,14 +131,6 @@ function extractBasicSheetName(message: string) {
   }
 
   return "";
-}
-
-async function saveAssistantMessage(text: string, userEmail: string | null) {
-  await supabase.from("messages").insert({
-    role: "assistant",
-    text,
-    user_email: userEmail,
-  });
 }
 
 export async function POST(req: Request) {
@@ -141,14 +160,6 @@ Zwróć WYŁĄCZNIE JSON:
 {
   "key": "krótka nazwa informacji",
   "value": "konkretna wartość do zapamiętania"
-}
-
-Przykład:
-Wiadomość: "Zapamiętaj że numer do Wiolety Biskup to 665331400"
-Odpowiedź:
-{
-  "key": "numer do Wiolety Biskup",
-  "value": "665331400"
 }
         `,
       });
@@ -211,9 +222,7 @@ ${memoryData.map((m) => `${m.key}: ${m.value}`).join("\n")}
 
       await saveAssistantMessage(assistantText, userEmail);
 
-      return Response.json({
-        text: assistantText,
-      });
+      return Response.json({ text: assistantText });
     }
 
     const oauth2Client = new google.auth.OAuth2();
@@ -232,21 +241,165 @@ ${memoryData.map((m) => `${m.key}: ${m.value}`).join("\n")}
       auth: oauth2Client,
     });
 
-    // ================= GOOGLE SHEETS — ODCZYT I ANALIZA =================
+    const gmail = google.gmail({
+      version: "v1",
+      auth: oauth2Client,
+    });
 
-    if (detectSheetQuestion(lastMessage)) {
-      const sheetNameAI = await openai.responses.create({
+    // ================= GMAIL — WYSZUKIWANIE I ANALIZA MAILI =================
+
+    if (detectGmailSearch(lastMessage) && !detectSheetQuestion(lastMessage)) {
+      const gmailIntent = await openai.responses.create({
         model: "gpt-4.1-mini",
         input: `
-Z wiadomości użytkownika wyciągnij nazwę arkusza Google, którego dotyczy pytanie.
+Użytkownik chce znaleźć albo przeanalizować maile Gmail.
 
 Wiadomość:
 "${lastMessage}"
 
+Zamień to na zapytanie Gmail search query.
+
+Zwróć WYŁĄCZNIE JSON:
+{
+  "query": "zapytanie Gmail",
+  "question": "pełne pytanie użytkownika"
+}
+
+Przykłady:
+- "pokaż ostatnie maile" -> "newer_than:14d"
+- "znajdź faktury z maja" -> "faktura OR invoice after:2026/05/01 before:2026/06/01"
+- "czy Adam pisał o spotkaniu" -> "Adam spotkanie"
+- "pokaż maile od Google" -> "from:google"
+        `,
+      });
+
+      let gmailParsed: any = {
+        query: "newer_than:14d",
+        question: lastMessage,
+      };
+
+      try {
+        gmailParsed = JSON.parse(gmailIntent.output_text);
+      } catch {
+        gmailParsed = {
+          query: "newer_than:14d",
+          question: lastMessage,
+        };
+      }
+
+      const list = await gmail.users.messages.list({
+        userId: "me",
+        q: gmailParsed.query || "newer_than:14d",
+        maxResults: 10,
+      });
+
+      const ids = list.data.messages || [];
+
+      if (!ids.length) {
+        const text = `Nie znalazłem maili pasujących do zapytania: "${gmailParsed.query}".`;
+
+        await saveAssistantMessage(text, userEmail);
+
+        return Response.json({ text });
+      }
+
+      const emails: any[] = [];
+
+      for (const item of ids) {
+        if (!item.id) continue;
+
+        const msg = await gmail.users.messages.get({
+          userId: "me",
+          id: item.id,
+          format: "full",
+        });
+
+        const headers = msg.data.payload?.headers || [];
+
+        const subject =
+          headers.find((h) => h.name?.toLowerCase() === "subject")?.value || "";
+        const from =
+          headers.find((h) => h.name?.toLowerCase() === "from")?.value || "";
+        const date =
+          headers.find((h) => h.name?.toLowerCase() === "date")?.value || "";
+
+        let body = "";
+
+        if (msg.data.payload?.body?.data) {
+          body = cleanBase64Url(msg.data.payload.body.data);
+        } else if (msg.data.payload?.parts?.length) {
+          const plainPart =
+            msg.data.payload.parts.find((p) => p.mimeType === "text/plain") ||
+            msg.data.payload.parts.find((p) => p.mimeType === "text/html");
+
+          body = cleanBase64Url(plainPart?.body?.data);
+        }
+
+        emails.push({
+          subject,
+          from,
+          date,
+          snippet: msg.data.snippet,
+          body: body.slice(0, 2500),
+        });
+      }
+
+      const analysis = await openai.responses.create({
+        model: "gpt-4.1-mini",
+        input: `
+Jesteś prywatnym asystentem analizującym Gmail użytkownika.
+
+${memoryContext}
+
+Pytanie użytkownika:
+${gmailParsed.question || lastMessage}
+
+Zapytanie Gmail:
+${gmailParsed.query}
+
+Znalezione maile:
+${JSON.stringify(emails)}
+
+Zasady:
+- Odpowiedz po polsku.
+- Nie mów, że nie masz dostępu do Gmaila, bo dane maili masz powyżej.
+- Jeśli użytkownik pyta o faktury, wypisz znalezione faktury i nadawców.
+- Jeśli użytkownik pyta o ważne maile, wybierz najważniejsze.
+- Jeśli pytanie dotyczy konkretnej osoby/tematu, znajdź pasujące maile.
+- Jeśli nie ma jednoznacznej informacji, napisz to jasno.
+        `,
+      });
+
+      const text = analysis.output_text;
+
+      await saveAssistantMessage(text, userEmail);
+
+      return Response.json({ text });
+    }
+
+    // ================= GOOGLE SHEETS — INTELIGENTNE WYSZUKIWANIE DANYCH =================
+
+    if (detectSheetQuestion(lastMessage)) {
+      const sheetIntent = await openai.responses.create({
+        model: "gpt-4.1-mini",
+        input: `
+Użytkownik pyta o dane z arkusza Google.
+
+Wiadomość:
+"${lastMessage}"
+
+Wyciągnij:
+1. nazwę arkusza,
+2. pytanie,
+3. szukaną osobę/temat, jeśli występuje,
+4. typ operacji.
+
 Zwróć WYŁĄCZNIE JSON:
 {
   "sheetName": "nazwa arkusza",
-  "question": "pełne pytanie użytkownika"
+  "question": "pełne pytanie użytkownika",
+  "searchTerm": "osoba, temat albo kategoria",
+  "operation": "find | sum | list | analyze"
 }
 
 Jeśli nazwa arkusza nie jest jasna, wpisz pusty string.
@@ -256,14 +409,18 @@ Jeśli nazwa arkusza nie jest jasna, wpisz pusty string.
       let parsedSheet: any = {
         sheetName: extractBasicSheetName(lastMessage),
         question: lastMessage,
+        searchTerm: "",
+        operation: "analyze",
       };
 
       try {
-        parsedSheet = JSON.parse(sheetNameAI.output_text);
+        parsedSheet = JSON.parse(sheetIntent.output_text);
       } catch {
         parsedSheet = {
           sheetName: extractBasicSheetName(lastMessage),
           question: lastMessage,
+          searchTerm: "",
+          operation: "analyze",
         };
       }
 
@@ -314,7 +471,7 @@ Jeśli nazwa arkusza nie jest jasna, wpisz pusty string.
 
         const sheetData = await sheets.spreadsheets.values.get({
           spreadsheetId: foundFile.id,
-          range: `${tabName}!A1:Z1000`,
+          range: `${tabName}!A1:Z2000`,
         });
 
         allData[tabName] = sheetData.data.values || [];
@@ -336,17 +493,24 @@ ${foundFile.webViewLink}
 Pytanie użytkownika:
 ${parsedSheet.question || lastMessage}
 
+Szukana fraza:
+${parsedSheet.searchTerm || ""}
+
+Typ operacji:
+${parsedSheet.operation || "analyze"}
+
 Dane ze wszystkich zakładek arkusza:
 ${JSON.stringify(allData)}
 
-Zasady odpowiedzi:
+Zasady:
 - Odpowiedz po polsku.
-- Nie dawaj instrukcji typu "użyj funkcji SUMIF".
-- Sam przeanalizuj dane.
-- Jeśli w pamięci jest korekta dotycząca pytanej osoby lub wartości, użyj pamięci jako ważniejszego źródła.
-- Jeśli użytkownik pyta o numer telefonu, mail, nazwisko albo konkretną osobę, znajdź pasujący wiersz i podaj znalezione dane.
-- Jeśli użytkownik pyta o sumę, policz ją na podstawie danych.
-- Jeśli dane są puste albo nie ma szukanej informacji, powiedz to jasno.
+- Sam analizuj dane, nie dawaj instrukcji.
+- Jeśli w pamięci jest korekta dotycząca pytanej osoby/wartości, pamięć ma pierwszeństwo.
+- Jeśli pytanie dotyczy numeru telefonu, maila, osoby lub konkretnego rekordu, znajdź najlepszy pasujący wiersz.
+- Jeśli pytanie dotyczy sumy, policz sumę na podstawie danych.
+- Jeśli pytanie dotyczy listy, wypisz pasujące rekordy.
+- Jeśli dane są puste, napisz że arkusz jest pusty.
+- Jeśli nie ma pasujących danych, napisz że nie znalazłeś.
 - Na końcu podaj link do arkusza.
         `,
       });
