@@ -14,7 +14,6 @@ const supabase = createClient(
 export async function POST(req: Request) {
   try {
     const { messages, userEmail, googleAccessToken } = await req.json();
-
     const lastMessage = messages[messages.length - 1]?.text || "";
 
     await supabase.from("messages").insert({
@@ -23,84 +22,213 @@ export async function POST(req: Request) {
       user_email: userEmail,
     });
 
-    if (!googleAccessToken) {
-      return Response.json({
-        text: "Zaloguj się ponownie przez Google.",
-      });
-    }
-
-    const oauth2Client = new google.auth.OAuth2();
-
-    oauth2Client.setCredentials({
-      access_token: googleAccessToken,
-    });
-
-    const drive = google.drive({
-      version: "v3",
-      auth: oauth2Client,
-    });
-
-    const sheets = google.sheets({
-      version: "v4",
-      auth: oauth2Client,
-    });
-
-    // ===== SPRAWDZENIE CZY TO PYTANIE O ARKUSZ =====
-
-    const sheetIntent = await openai.responses.create({
+    const intentResponse = await openai.responses.create({
       model: "gpt-4.1-mini",
       input: `
-Sprawdź czy użytkownik pyta o dane z arkusza Google.
+Dzisiaj jest ${new Date().toISOString()}.
+Strefa czasowa: Europe/Warsaw.
 
-Wiadomość:
+Rozpoznaj intencję użytkownika.
+
+WAŻNE:
+- Jeśli użytkownik pyta o dane z istniejącego arkusza, np. "ile wydałem", "pokaż dane", "sprawdź arkusz", "przeanalizuj arkusz" → action = "read_sheet".
+- Jeśli użytkownik chce STWORZYĆ NOWY arkusz, np. "stwórz arkusz", "utwórz tabelę", "załóż arkusz" → action = "create_sheet".
+- Jeśli użytkownik chce dodać wydarzenie do kalendarza → action = "calendar".
+- Jeśli zwykła rozmowa → action = "none".
+
+Wiadomość użytkownika:
 "${lastMessage}"
 
-Zwróć TYLKO JSON:
+Zwróć WYŁĄCZNIE JSON.
 
+Dla odczytu arkusza:
 {
-  "isSheetQuestion": true,
+  "action": "read_sheet",
   "sheetName": "nazwa arkusza",
-  "question": "krótkie pytanie"
+  "question": "pytanie użytkownika"
 }
 
-lub
-
+Dla tworzenia arkusza:
 {
-  "isSheetQuestion": false
+  "action": "create_sheet",
+  "title": "nazwa arkusza",
+  "sheetName": "Dane",
+  "headers": ["Data", "Kategoria", "Opis", "Kwota", "Uwagi"],
+  "rows": []
+}
+
+Dla kalendarza:
+{
+  "action": "calendar",
+  "title": "tytuł wydarzenia",
+  "start": "ISO datetime",
+  "end": "ISO datetime",
+  "description": "opis"
+}
+
+Dla zwykłej rozmowy:
+{
+  "action": "none"
 }
       `,
     });
 
-    let parsedIntent: any = {
-      isSheetQuestion: false,
-    };
+    let action: any = { action: "none" };
 
     try {
-      parsedIntent = JSON.parse(sheetIntent.output_text);
-    } catch {}
+      action = JSON.parse(intentResponse.output_text);
+    } catch {
+      action = { action: "none" };
+    }
 
-    // ===== ODCZYT ARKUSZA =====
+    if (
+      ["calendar", "create_sheet", "read_sheet"].includes(action.action) &&
+      !googleAccessToken
+    ) {
+      const text =
+        "Brak dostępu do Google. Wyloguj się i zaloguj ponownie przez Google.";
 
-    if (parsedIntent.isSheetQuestion) {
-      const driveFiles = await drive.files.list({
-        q: `
-mimeType='application/vnd.google-apps.spreadsheet'
-and name contains '${parsedIntent.sheetName}'
-        `,
-        fields: "files(id, name)",
+      await supabase.from("messages").insert({
+        role: "assistant",
+        text,
+        user_email: userEmail,
       });
 
-      const foundFile = driveFiles.data.files?.[0];
+      return Response.json({ text });
+    }
+
+    const oauth2Client = new google.auth.OAuth2();
+    oauth2Client.setCredentials({
+      access_token: googleAccessToken,
+    });
+
+    if (action.action === "calendar") {
+      const calendar = google.calendar({
+        version: "v3",
+        auth: oauth2Client,
+      });
+
+      await calendar.events.insert({
+        calendarId: "primary",
+        requestBody: {
+          summary: action.title,
+          description: action.description,
+          start: {
+            dateTime: action.start,
+            timeZone: "Europe/Warsaw",
+          },
+          end: {
+            dateTime: action.end,
+            timeZone: "Europe/Warsaw",
+          },
+        },
+      });
+
+      const text = `Gotowe ✅ Dodałem wydarzenie do Twojego kalendarza: "${action.title}"`;
+
+      await supabase.from("messages").insert({
+        role: "assistant",
+        text,
+        user_email: userEmail,
+      });
+
+      return Response.json({ text });
+    }
+
+    if (action.action === "create_sheet") {
+      const sheets = google.sheets({
+        version: "v4",
+        auth: oauth2Client,
+      });
+
+      const spreadsheet = await sheets.spreadsheets.create({
+        requestBody: {
+          properties: {
+            title: action.title || "Nowy arkusz AI",
+          },
+          sheets: [
+            {
+              properties: {
+                title: action.sheetName || "Dane",
+              },
+            },
+          ],
+        },
+      });
+
+      const spreadsheetId = spreadsheet.data.spreadsheetId!;
+      const sheetName = action.sheetName || "Dane";
+
+      const headers = action.headers?.length
+        ? action.headers
+        : ["Data", "Kategoria", "Opis", "Kwota", "Uwagi"];
+
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `${sheetName}!A1`,
+        valueInputOption: "USER_ENTERED",
+        requestBody: {
+          values: [headers, ...(action.rows || [])],
+        },
+      });
+
+      const text = `Gotowe ✅ Utworzyłem arkusz Google: "${action.title}". Link: ${spreadsheet.data.spreadsheetUrl}`;
+
+      await supabase.from("messages").insert({
+        role: "assistant",
+        text,
+        user_email: userEmail,
+      });
+
+      return Response.json({ text });
+    }
+
+    if (action.action === "read_sheet") {
+      const drive = google.drive({
+        version: "v3",
+        auth: oauth2Client,
+      });
+
+      const sheets = google.sheets({
+        version: "v4",
+        auth: oauth2Client,
+      });
+
+      const sheetNameToFind = action.sheetName || "";
+
+      const files = await drive.files.list({
+        q: `mimeType='application/vnd.google-apps.spreadsheet' and name contains '${sheetNameToFind.replace(
+          /'/g,
+          "\\'"
+        )}'`,
+        fields: "files(id, name)",
+        pageSize: 10,
+      });
+
+      const foundFile = files.data.files?.[0];
 
       if (!foundFile?.id) {
-        return Response.json({
-          text: `Nie znalazłem arkusza "${parsedIntent.sheetName}".`,
+        const text = `Nie znalazłem arkusza o nazwie zawierającej: "${sheetNameToFind}".`;
+
+        await supabase.from("messages").insert({
+          role: "assistant",
+          text,
+          user_email: userEmail,
         });
+
+        return Response.json({ text });
       }
+
+      const spreadsheetInfo = await sheets.spreadsheets.get({
+        spreadsheetId: foundFile.id,
+      });
+
+      const firstSheetName =
+        spreadsheetInfo.data.sheets?.[0]?.properties?.title || "Arkusz1";
 
       const sheetData = await sheets.spreadsheets.values.get({
         spreadsheetId: foundFile.id,
-        range: "A1:Z1000",
+        range: `${firstSheetName}!A1:Z1000`,
       });
 
       const values = sheetData.data.values || [];
@@ -108,32 +236,31 @@ and name contains '${parsedIntent.sheetName}'
       const analysis = await openai.responses.create({
         model: "gpt-4.1-mini",
         input: `
-Użytkownik zadał pytanie o arkusz Google.
+Użytkownik pyta o dane z istniejącego arkusza Google.
 
-PYTANIE:
-${parsedIntent.question}
+Nazwa znalezionego arkusza:
+${foundFile.name}
 
-DANE Z ARKUSZA:
+Pytanie użytkownika:
+${action.question || lastMessage}
+
+Dane z arkusza:
 ${JSON.stringify(values)}
 
-Odpowiedz normalnie po polsku i przeanalizuj dane.
+Odpowiedz po polsku. Jeśli dane są puste albo brakuje informacji, powiedz to jasno.
         `,
       });
 
-      const assistantText = analysis.output_text;
+      const text = analysis.output_text;
 
       await supabase.from("messages").insert({
         role: "assistant",
-        text: assistantText,
+        text,
         user_email: userEmail,
       });
 
-      return Response.json({
-        text: assistantText,
-      });
+      return Response.json({ text });
     }
-
-    // ===== NORMALNY CHAT =====
 
     const response = await openai.responses.create({
       model: "gpt-4.1-mini",
