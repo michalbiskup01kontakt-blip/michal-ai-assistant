@@ -19,6 +19,18 @@ function escapeGoogleQuery(text: string) {
   return text.replace(/'/g, "\\'");
 }
 
+function detectMemorySave(message: string) {
+  const text = normalize(message);
+
+  return (
+    text.includes("zapamiętaj") ||
+    text.includes("pamietaj") ||
+    text.includes("zapamiętasz") ||
+    text.includes("następnym razem będziesz pamiętał") ||
+    text.includes("następnym razem bedziesz pamietal")
+  );
+}
+
 function detectDriveSearch(message: string) {
   const text = normalize(message);
 
@@ -114,13 +126,94 @@ export async function POST(req: Request) {
       user_email: userEmail,
     });
 
+    // ================= MEMORY SAVE =================
+
+    if (detectMemorySave(lastMessage)) {
+      const memoryAI = await openai.responses.create({
+        model: "gpt-4.1-mini",
+        input: `
+Wyciągnij z wiadomości użytkownika informację do zapamiętania.
+
+Wiadomość:
+"${lastMessage}"
+
+Zwróć WYŁĄCZNIE JSON:
+{
+  "key": "krótka nazwa informacji",
+  "value": "konkretna wartość do zapamiętania"
+}
+
+Przykład:
+Wiadomość: "Zapamiętaj że numer do Wiolety Biskup to 665331400"
+Odpowiedź:
+{
+  "key": "numer do Wiolety Biskup",
+  "value": "665331400"
+}
+        `,
+      });
+
+      let parsedMemory: any = null;
+
+      try {
+        parsedMemory = JSON.parse(memoryAI.output_text);
+      } catch {
+        parsedMemory = null;
+      }
+
+      if (parsedMemory?.key && parsedMemory?.value) {
+        await supabase.from("memory").insert({
+          user_email: userEmail,
+          key: parsedMemory.key,
+          value: parsedMemory.value,
+        });
+
+        const text = `Zapamiętałem ✅ ${parsedMemory.key}: ${parsedMemory.value}`;
+
+        await saveAssistantMessage(text, userEmail);
+
+        return Response.json({ text });
+      }
+    }
+
+    // ================= MEMORY LOAD =================
+
+    const { data: memoryData } = await supabase
+      .from("memory")
+      .select("*")
+      .eq("user_email", userEmail);
+
+    const memoryContext =
+      memoryData && memoryData.length > 0
+        ? `
+Zapamiętane informacje użytkownika:
+${memoryData.map((m) => `${m.key}: ${m.value}`).join("\n")}
+`
+        : "";
+
     if (!googleAccessToken) {
-      const text =
-        "Brak dostępu do Google. Wyloguj się i zaloguj ponownie przez Google.";
+      const response = await openai.responses.create({
+        model: "gpt-4.1-mini",
+        tools: [{ type: "web_search" }],
+        input: [
+          {
+            role: "system",
+            content: memoryContext,
+          },
+          ...messages.map((msg: any) => ({
+            role: msg.role,
+            content: msg.text,
+          })),
+        ],
+      });
 
-      await saveAssistantMessage(text, userEmail);
+      const assistantText = response.output_text;
 
-      return Response.json({ text });
+      await saveAssistantMessage(assistantText, userEmail);
+
+      return Response.json({
+        text: assistantText,
+      });
     }
 
     const oauth2Client = new google.auth.OAuth2();
@@ -174,7 +267,7 @@ Jeśli nazwa arkusza nie jest jasna, wpisz pusty string.
         };
       }
 
-      let sheetNameToFind =
+      const sheetNameToFind =
         parsedSheet.sheetName?.trim() || extractBasicSheetName(lastMessage);
 
       if (!sheetNameToFind) {
@@ -232,6 +325,8 @@ Jeśli nazwa arkusza nie jest jasna, wpisz pusty string.
         input: `
 Jesteś asystentem analizującym dane z Google Sheets.
 
+${memoryContext}
+
 Znaleziony arkusz:
 ${foundFile.name}
 
@@ -248,6 +343,7 @@ Zasady odpowiedzi:
 - Odpowiedz po polsku.
 - Nie dawaj instrukcji typu "użyj funkcji SUMIF".
 - Sam przeanalizuj dane.
+- Jeśli w pamięci jest korekta dotycząca pytanej osoby lub wartości, użyj pamięci jako ważniejszego źródła.
 - Jeśli użytkownik pyta o numer telefonu, mail, nazwisko albo konkretną osobę, znajdź pasujący wiersz i podaj znalezione dane.
 - Jeśli użytkownik pyta o sumę, policz ją na podstawie danych.
 - Jeśli dane są puste albo nie ma szukanej informacji, powiedz to jasno.
@@ -481,15 +577,21 @@ albo:
       return Response.json({ text });
     }
 
-    // ================= NORMALNY CHAT + INTERNET =================
+    // ================= NORMALNY CHAT + INTERNET + MEMORY =================
 
     const response = await openai.responses.create({
       model: "gpt-4.1-mini",
       tools: [{ type: "web_search" }],
-      input: messages.map((msg: any) => ({
-        role: msg.role,
-        content: msg.text,
-      })),
+      input: [
+        {
+          role: "system",
+          content: memoryContext,
+        },
+        ...messages.map((msg: any) => ({
+          role: msg.role,
+          content: msg.text,
+        })),
+      ],
     });
 
     const assistantText = response.output_text;
