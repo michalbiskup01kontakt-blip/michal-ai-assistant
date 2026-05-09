@@ -82,6 +82,8 @@ export default function Home() {
           "https://www.googleapis.com/auth/calendar",
           "https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive",
+          "https://www.googleapis.com/auth/drive.readonly",
+          "https://www.googleapis.com/auth/gmail.readonly",
           "https://www.googleapis.com/auth/gmail.modify",
         ].join(" "),
         queryParams: {
@@ -112,21 +114,21 @@ export default function Home() {
   async function sendMessage() {
     if (!input.trim() || loading) return;
 
+    const userText = input;
+
     const userMessage: Message = {
       role: "user",
-      text: input,
+      text: userText,
     };
 
-    const newMessages = [...messages, userMessage];
-
-    setMessages(newMessages);
+    setMessages((prev) => [...prev, userMessage]);
     setInput("");
     setLoading(true);
 
     try {
       const sessionResult = await supabase.auth.getSession();
 
-      const googleAccessToken =
+      const accessToken =
         sessionResult.data.session?.provider_token ?? null;
 
       const response = await fetch("/api/chat", {
@@ -135,9 +137,9 @@ export default function Home() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          messages: newMessages,
+          message: userText,
           userEmail,
-          googleAccessToken,
+          accessToken,
         }),
       });
 
@@ -145,7 +147,10 @@ export default function Home() {
 
       const assistantMessage: Message = {
         role: "assistant",
-        text: data.text || "Nie udało mi się wygenerować odpowiedzi.",
+        text:
+          data.reply ||
+          data.text ||
+          "Nie udało mi się wygenerować odpowiedzi.",
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
