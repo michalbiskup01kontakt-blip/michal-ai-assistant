@@ -114,10 +114,11 @@ export default function Home() {
           "Content-Type": "application/json",
         },
 
-        body: JSON.stringify({
-          messages: newMessages,
-          userEmail,
-        }),
+body: JSON.stringify({
+  messages: newMessages,
+  userEmail,
+  googleAccessToken: (await supabase.auth.getSession()).data.session?.provider_token,
+}),
       });
 
       const data = await response.json();
@@ -221,4 +222,3 @@ export default function Home() {
       </div>
     </main>
   );
-}
