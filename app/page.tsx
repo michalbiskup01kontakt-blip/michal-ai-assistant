@@ -23,7 +23,6 @@ export default function Home() {
   useEffect(() => {
     async function loadUserAndMessages() {
       const { data } = await supabase.auth.getUser();
-
       const email = data.user?.email ?? null;
 
       setUserEmail(email);
@@ -54,17 +53,15 @@ export default function Home() {
       provider: "google",
       options: {
         redirectTo: window.location.origin,
-
         scopes: [
+          "openid",
           "email",
           "profile",
-          "openid",
           "https://www.googleapis.com/auth/calendar",
           "https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive",
           "https://www.googleapis.com/auth/gmail.modify",
         ].join(" "),
-
         queryParams: {
           access_type: "offline",
           prompt: "consent",
@@ -101,24 +98,25 @@ export default function Home() {
     const newMessages = [...messages, userMessage];
 
     setMessages(newMessages);
-
     setInput("");
-
     setLoading(true);
 
     try {
+      const sessionResult = await supabase.auth.getSession();
+
+      const googleAccessToken =
+        sessionResult.data.session?.provider_token ?? null;
+
       const response = await fetch("/api/chat", {
         method: "POST",
-
         headers: {
           "Content-Type": "application/json",
         },
-
-body: JSON.stringify({
-  messages: newMessages,
-  userEmail,
-  googleAccessToken: (await supabase.auth.getSession()).data.session?.provider_token,
-}),
+        body: JSON.stringify({
+          messages: newMessages,
+          userEmail,
+          googleAccessToken,
+        }),
       });
 
       const data = await response.json();
@@ -145,9 +143,7 @@ body: JSON.stringify({
   return (
     <main className="min-h-screen bg-zinc-950 text-white flex items-center justify-center p-6">
       <div className="w-full max-w-3xl rounded-2xl bg-zinc-900 border border-zinc-800 p-6 shadow-xl">
-        <p className="text-sm text-blue-400 mb-2">
-          Asystent Michała v2
-        </p>
+        <p className="text-sm text-blue-400 mb-2">Asystent Michała v2</p>
 
         <h1 className="text-3xl font-bold mb-4">
           Twój prywatny asystent AI
@@ -222,3 +218,4 @@ body: JSON.stringify({
       </div>
     </main>
   );
+}
