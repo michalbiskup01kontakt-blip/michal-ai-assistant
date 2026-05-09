@@ -23,7 +23,7 @@ export default function Home() {
     await supabase.auth.signInWithOAuth({
       provider: "google",
       options: {
-        redirectTo: "http://localhost:3000",
+        redirectTo: "https://michal-ai-assistant.vercel.app",
       },
     });
   }
@@ -77,7 +77,9 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-zinc-950 text-white flex items-center justify-center p-6">
       <div className="w-full max-w-3xl rounded-2xl bg-zinc-900 border border-zinc-800 p-6 shadow-xl">
-        <p className="text-sm text-blue-400 mb-2">Asystent Michała v1</p>
+        <p className="text-sm text-blue-400 mb-2">
+          Asystent Michała v1
+        </p>
 
         <h1 className="text-3xl font-bold mb-4">
           Twój prywatny asystent AI
