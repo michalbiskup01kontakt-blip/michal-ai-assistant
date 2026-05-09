@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { supabase } from "./lib/supabase";
 
 type Message = {
@@ -18,14 +18,32 @@ export default function Home() {
 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => {
+      setUserEmail(data.user?.email ?? null);
+    });
+  }, []);
 
   async function loginWithGoogle() {
-    await supabase.auth.signInWithOAuth({
+    const redirectUrl = window.location.origin;
+
+    const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
       options: {
-        redirectTo: "https://michal-ai-assistant.vercel.app",
+        redirectTo: redirectUrl,
       },
     });
+
+    if (error) {
+      alert("Błąd logowania: " + error.message);
+    }
+  }
+
+  async function logout() {
+    await supabase.auth.signOut();
+    setUserEmail(null);
   }
 
   async function sendMessage() {
@@ -77,13 +95,17 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-zinc-950 text-white flex items-center justify-center p-6">
       <div className="w-full max-w-3xl rounded-2xl bg-zinc-900 border border-zinc-800 p-6 shadow-xl">
-        <p className="text-sm text-blue-400 mb-2">
-          Asystent Michała v1
-        </p>
+        <p className="text-sm text-blue-400 mb-2">Asystent Michała v1</p>
 
         <h1 className="text-3xl font-bold mb-4">
           Twój prywatny asystent AI
         </h1>
+
+        {userEmail && (
+          <p className="mb-4 text-sm text-green-400">
+            Zalogowano jako: {userEmail}
+          </p>
+        )}
 
         <div className="h-96 overflow-y-auto rounded-xl bg-zinc-950 border border-zinc-800 p-4 mb-4 space-y-3">
           {messages.map((message, index) => (
@@ -107,12 +129,21 @@ export default function Home() {
         </div>
 
         <div className="space-y-3">
-          <button
-            onClick={loginWithGoogle}
-            className="w-full rounded-lg bg-white text-black py-3 font-medium"
-          >
-            Zaloguj przez Google
-          </button>
+          {!userEmail ? (
+            <button
+              onClick={loginWithGoogle}
+              className="w-full rounded-lg bg-white text-black py-3 font-medium"
+            >
+              Zaloguj przez Google
+            </button>
+          ) : (
+            <button
+              onClick={logout}
+              className="w-full rounded-lg bg-red-500 text-white py-3 font-medium"
+            >
+              Wyloguj
+            </button>
+          )}
 
           <div className="flex gap-3">
             <input
