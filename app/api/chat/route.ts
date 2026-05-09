@@ -6,7 +6,7 @@ const client = new OpenAI({
 });
 
 export async function POST(request: Request) {
-  const { messages } = await request.json();
+  const { messages, userEmail } = await request.json();
 
   const lastMessage = messages[messages.length - 1];
 
@@ -14,6 +14,7 @@ export async function POST(request: Request) {
     {
       role: lastMessage.role,
       text: lastMessage.text,
+      user_email: userEmail,
     },
   ]);
 
@@ -25,16 +26,17 @@ export async function POST(request: Request) {
     })),
   });
 
-  const assistantResponseText = response.output_text;
+  const assistantText = response.output_text;
 
   await supabase.from("messages").insert([
     {
       role: "assistant",
-      text: assistantResponseText,
+      text: assistantText,
+      user_email: userEmail,
     },
   ]);
 
   return Response.json({
-    text: assistantResponseText,
+    text: assistantText,
   });
 }

@@ -21,18 +21,38 @@ export default function Home() {
   const [userEmail, setUserEmail] = useState<string | null>(null);
 
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      setUserEmail(data.user?.email ?? null);
-    });
+    async function loadUserAndMessages() {
+      const { data } = await supabase.auth.getUser();
+      const email = data.user?.email ?? null;
+
+      setUserEmail(email);
+
+      if (!email) return;
+
+      const { data: savedMessages } = await supabase
+        .from("messages")
+        .select("role, text")
+        .eq("user_email", email)
+        .order("created_at", { ascending: true });
+
+      if (savedMessages && savedMessages.length > 0) {
+        setMessages(
+          savedMessages.map((message) => ({
+            role: message.role as "user" | "assistant",
+            text: message.text,
+          }))
+        );
+      }
+    }
+
+    loadUserAndMessages();
   }, []);
 
   async function loginWithGoogle() {
-    const redirectUrl = window.location.origin;
-
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
       options: {
-        redirectTo: redirectUrl,
+        redirectTo: window.location.origin,
       },
     });
 
@@ -44,6 +64,12 @@ export default function Home() {
   async function logout() {
     await supabase.auth.signOut();
     setUserEmail(null);
+    setMessages([
+      {
+        role: "assistant",
+        text: "Cześć Michał. Jestem Twoim prywatnym asystentem AI. W czym mogę pomóc?",
+      },
+    ]);
   }
 
   async function sendMessage() {
@@ -68,6 +94,7 @@ export default function Home() {
         },
         body: JSON.stringify({
           messages: newMessages,
+          userEmail,
         }),
       });
 
