@@ -1,135 +1,147 @@
 import OpenAI from "openai";
 import { google } from "googleapis";
-import { supabase } from "@/app/lib/supabase";
+import { createClient } from "@supabase/supabase-js";
 
-const client = new OpenAI({
+const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-export async function POST(request: Request) {
-  const { messages, userEmail, googleAccessToken } = await request.json();
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
 
-  const lastMessage = messages[messages.length - 1];
+export async function POST(req: Request) {
+  try {
+    const body = await req.json();
 
-  await supabase.from("messages").insert([
-    {
-      role: lastMessage.role,
-      text: lastMessage.text,
+    const { messages, userEmail, googleAccessToken } = body;
+
+    const lastMessage = messages[messages.length - 1]?.text || "";
+
+    // zapis wiadomości użytkownika
+    await supabase.from("messages").insert({
+      role: "user",
+      text: lastMessage,
       user_email: userEmail,
-    },
-  ]);
+    });
 
-  const calendarCheck = await client.responses.create({
-    model: "gpt-4.1-mini",
-    input: `
-Dzisiaj jest: ${new Date().toISOString()}.
-Strefa czasowa użytkownika: Europe/Warsaw.
+    // sprawdzenie czy użytkownik chce utworzyć wydarzenie
+    const calendarIntent = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: `
+Dzisiaj jest ${new Date().toISOString()}.
 
-Sprawdź, czy użytkownik chce utworzyć wydarzenie w kalendarzu Google.
+Przeanalizuj wiadomość użytkownika i sprawdź,
+czy chce utworzyć wydarzenie w kalendarzu.
 
-Wiadomość użytkownika:
-"${lastMessage.text}"
+Wiadomość:
+"${lastMessage}"
 
-Odpowiedz TYLKO czystym JSON bez markdown:
+Jeśli TAK:
+zwróć WYŁĄCZNIE JSON:
+
 {
-  "isCalendarRequest": true/false,
-  "title": "tytuł wydarzenia",
-  "startDateTime": "ISO datetime",
-  "endDateTime": "ISO datetime",
-  "description": "opis"
+  "calendar": true,
+  "title": "...",
+  "start": "...",
+  "end": "...",
+  "description": "..."
 }
 
-Jeśli brakuje godziny lub daty, ustaw isCalendarRequest na false.
-    `,
-  });
+Daty zwracaj w formacie ISO.
 
-  let calendarData: any = null;
+Jeśli NIE:
+{
+  "calendar": false
+}
+      `,
+    });
 
-  try {
-    calendarData = JSON.parse(calendarCheck.output_text);
-  } catch {
-    calendarData = { isCalendarRequest: false };
-  }
+    let parsed: any = {};
 
-  if (calendarData.isCalendarRequest) {
-    if (!googleAccessToken) {
-      const assistantText =
-        "Musisz zalogować się ponownie przez Google i zaakceptować dostęp do kalendarza.";
-
-      await supabase.from("messages").insert([
-        {
-          role: "assistant",
-          text: assistantText,
-          user_email: userEmail,
-        },
-      ]);
-
-      return Response.json({ text: assistantText });
+    try {
+      parsed = JSON.parse(calendarIntent.output_text);
+    } catch {
+      parsed = { calendar: false };
     }
 
-    const oauth2Client = new google.auth.OAuth2();
+    // tworzenie wydarzenia
+    if (parsed.calendar === true) {
+      if (!googleAccessToken) {
+        return Response.json({
+          text: "Brak dostępu do Google Calendar. Zaloguj się ponownie.",
+        });
+      }
 
-    oauth2Client.setCredentials({
-      access_token: googleAccessToken,
-    });
+      const oauth2Client = new google.auth.OAuth2();
 
-    const calendar = google.calendar({
-      version: "v3",
-      auth: oauth2Client,
-    });
+      oauth2Client.setCredentials({
+        access_token: googleAccessToken,
+      });
 
-    const event = await calendar.events.insert({
-      calendarId: "primary",
-      requestBody: {
-        summary: calendarData.title,
-        description: calendarData.description,
-        start: {
-          dateTime: calendarData.startDateTime,
-          timeZone: "Europe/Warsaw",
+      const calendar = google.calendar({
+        version: "v3",
+        auth: oauth2Client,
+      });
+
+      const createdEvent = await calendar.events.insert({
+        calendarId: "primary",
+        requestBody: {
+          summary: parsed.title,
+          description: parsed.description,
+          start: {
+            dateTime: parsed.start,
+            timeZone: "Europe/Warsaw",
+          },
+          end: {
+            dateTime: parsed.end,
+            timeZone: "Europe/Warsaw",
+          },
         },
-        end: {
-          dateTime: calendarData.endDateTime,
-          timeZone: "Europe/Warsaw",
-        },
-      },
-    });
+      });
 
-    const assistantText = `Gotowe — dodałem wydarzenie do Twojego kalendarza: ${calendarData.title}.`;
+      const assistantResponse = `Gotowe ✅ Dodałem wydarzenie do Twojego kalendarza: "${parsed.title}"`;
 
-    await supabase.from("messages").insert([
-      {
+      await supabase.from("messages").insert({
         role: "assistant",
-        text: assistantText,
+        text: assistantResponse,
         user_email: userEmail,
-      },
-    ]);
+      });
 
-    return Response.json({
-      text: assistantText,
-      eventLink: event.data.htmlLink,
+      return Response.json({
+        text: assistantResponse,
+        eventLink: createdEvent.data.htmlLink,
+      });
+    }
+
+    // normalna odpowiedź AI
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      tools: [{ type: "web_search" }],
+      input: messages.map((msg: any) => ({
+        role: msg.role,
+        content: msg.text,
+      })),
     });
-  }
 
-  const response = await client.responses.create({
-    model: "gpt-4.1-mini",
-    tools: [{ type: "web_search" }],
-    input: messages.map((message: any) => ({
-      role: message.role,
-      content: message.text,
-    })),
-  });
+    const assistantText = response.output_text;
 
-  const assistantText = response.output_text;
-
-  await supabase.from("messages").insert([
-    {
+    // zapis odpowiedzi AI
+    await supabase.from("messages").insert({
       role: "assistant",
       text: assistantText,
       user_email: userEmail,
-    },
-  ]);
+    });
 
-  return Response.json({
-    text: assistantText,
-  });
+    return Response.json({
+      text: assistantText,
+    });
+  } catch (error) {
+    console.error(error);
+
+    return Response.json({
+      text: "Wystąpił błąd serwera.",
+    });
+  }
 }
